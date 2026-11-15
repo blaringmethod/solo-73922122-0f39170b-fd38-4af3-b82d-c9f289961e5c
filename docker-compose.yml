@@ -17,6 +17,7 @@ services:
   collector:
     build: .
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    restart: unless-stopped
     environment:
       FEED_BASE_URL: http://feed:8010
       COLLECTOR_DB: /data/collector.db

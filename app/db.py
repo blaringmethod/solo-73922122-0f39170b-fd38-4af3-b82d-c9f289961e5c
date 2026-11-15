@@ -7,11 +7,17 @@
   (产品编码, 批号) 只有一条有效记录，来源公告为多值聚合；
 - 提交时做“旧版本保护”：只有更新的源版本或更大的 run_id 才能发布，
   并发采集里晚完成的旧版本运行无法覆盖先发布的新版本；
-- 清单 JSON 文件与数据库提交保持同版（先原子写文件，再提交事务）。
+- 数据库（已提交事务）是清单的唯一事实来源：先提交事务，再在事务外
+  原子落盘同版 JSON。事务提交失败时文件绝不会被替换；
+- 启动时与停售接口每次读文件都会做 *对账*：落盘 JSON 的
+  published_run_id 必须等于数据库 manifest_meta 的已提交指针，
+  文件缺失、损坏、超前（未提交版本）或落后（提交后落盘前崩溃）时
+  一律以数据库为准重建，保证网页与停售接口在任何崩溃/重启后仍同版。
 """
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -24,6 +30,8 @@ from . import config
 
 # 写操作串行化（SQLite 单写者），配合 WAL 提升并发读体验
 _WRITE_LOCK = threading.RLock()
+
+logger = logging.getLogger(__name__)
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -242,11 +250,29 @@ def _atomic_write_manifest(path: Path, payload: dict) -> None:
     """同目录临时文件 + os.replace 保证清单文件原子替换。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(payload, fh, ensure_ascii=False, indent=2)
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        # 写一半进程没崩但本次写入失败时，不残留临时文件
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+
+def _empty_manifest_payload() -> dict:
+    """数据库尚无已发布版本时的空清单（与历史空响应形态保持一致）。"""
+    return {
+        "manifest_version": 1,
+        "published_run_id": None,
+        "source_directory_version": None,
+        "generated_at": utc_now_iso(),
+        "entry_count": 0,
+        "products": [],
+        "note": "尚未发布任何清单",
+    }
 
 
 def build_manifest_payload(conn: sqlite3.Connection, run_id: int,
@@ -280,8 +306,69 @@ def build_manifest_payload(conn: sqlite3.Connection, run_id: int,
     }
 
 
+def _payload_from_db() -> dict:
+    """按数据库已提交状态构建当前应发布的 JSON（独立只读连接）。"""
+    meta = get_published_meta()
+    if meta is None:
+        return _empty_manifest_payload()
+    with connect() as conn:
+        return build_manifest_payload(
+            conn, meta["published_run_id"], meta["source_version"]
+        )
+
+
+def _read_manifest_file() -> Optional[dict]:
+    """读取落盘清单；文件缺失或内容非法时返回 None。"""
+    path = config.MANIFEST_PATH
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return None
+
+
+def reconcile_manifest_file() -> dict:
+    """以数据库已提交状态为准，对账并（必要时）重建落盘 JSON。
+
+    只有文件内容的 published_run_id / 空发布标记与数据库完全一致时
+    才保留文件，否则原子重写。数据库为空而存在游离文件时也会清空，
+    确保停售接口永远返回已提交版本。
+    """
+    with _WRITE_LOCK:
+        expected = _payload_from_db()
+        on_disk = _read_manifest_file()
+        if on_disk is not None and on_disk.get("published_run_id") == \
+                expected["published_run_id"]:
+            return on_disk
+        logger.warning(
+            "停售清单文件与数据库已提交版本不一致（文件=%r，期望 run=%s），按数据库重建",
+            None if on_disk is None else on_disk.get("published_run_id"),
+            expected["published_run_id"],
+        )
+        _atomic_write_manifest(config.MANIFEST_PATH, expected)
+        return expected
+
+
+def read_or_repair_manifest() -> dict:
+    """停售接口读取入口：文件与数据库同版则直接返回，否则触发对账。"""
+    on_disk = _read_manifest_file()
+    meta = get_published_meta()
+    expected_run = meta["published_run_id"] if meta else None
+    if on_disk is not None and on_disk.get("published_run_id") == expected_run:
+        return on_disk
+    # 文件缺失、损坏、超前（未提交版本）或落后（提交后、落盘前崩溃）
+    return reconcile_manifest_file()
+
+
 def commit_run(run_id: int, source_version: int) -> dict:
-    """把暂存数据整体发布为新清单。失败抛异常，正式清单保持不变。"""
+    """把暂存数据整体发布为新清单。
+
+    顺序保证：先在单个事务内提交数据库，事务提交成功后才在事务外
+    原子落盘同版 JSON。事务失败时一切随回滚保持上轮，文件不被触碰；
+    落盘失败或进程在提交与落盘之间退出，由 reconcile_manifest_file
+    在重启/下次读取时按已提交数据库补齐。
+    """
     with _WRITE_LOCK, connect() as conn:
         with write_tx(conn):
             # ---- 旧版本保护：晚完成的旧版本运行不能覆盖先发布的新版本 ----
@@ -354,11 +441,6 @@ def commit_run(run_id: int, source_version: int) -> dict:
                 )
 
             entry_count = len(staged)
-            payload = build_manifest_payload(conn, run_id, source_version)
-
-            # 先原子落盘同版 JSON，再提交事务；提交失败则文件随下次发布纠正
-            _atomic_write_manifest(config.MANIFEST_PATH, payload)
-
             conn.execute("DELETE FROM manifest_meta WHERE id=1")
             conn.execute(
                 "INSERT INTO manifest_meta (id, published_run_id, source_version, "
@@ -372,7 +454,20 @@ def commit_run(run_id: int, source_version: int) -> dict:
             )
             conn.execute(f"DROP TABLE IF EXISTS stage_ann_{run_id}")
             conn.execute(f"DROP TABLE IF EXISTS stage_batch_{run_id}")
-            return payload
+
+        # with write_tx 正常退出即事务提交成功；此处起数据库已落定为新轮次
+        payload = build_manifest_payload(conn, run_id, source_version)
+
+        # ---- 事务提交之后再原子落盘同版 JSON ----
+        # 落盘失败不改变“已发布”事实：启动对账与停售接口读取时会按数据库补齐。
+        # 异常就地吞掉，避免冒泡到 sqlite3 连接上下文触发多余的 rollback。
+        try:
+            _atomic_write_manifest(config.MANIFEST_PATH, payload)
+        except OSError:
+            logger.exception(
+                "运行 %s 已提交数据库，但清单 JSON 落盘失败，等待对账补齐", run_id
+            )
+    return payload
 
 
 # ---------------------------------------------------------------------------

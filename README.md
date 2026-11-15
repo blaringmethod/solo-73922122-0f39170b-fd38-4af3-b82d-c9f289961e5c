@@ -43,7 +43,15 @@ docker compose up --build
 
 ### 2. 成功后整体替换，失败保留上轮清单
 
-抓取结果先写入以 `run_id` 命名的 SQLite 暂存表（`stage_ann_*`、`stage_batch_*`）；全部成功后在**单个事务**内清空并重建正式清单，同时用「同目录临时文件 + `os.replace` + `fsync`」原子替换 JSON 文件。任何失败（网络、HTTP 错误、CSV 非 UTF-8/缺列、分页异常、取消）都只清理暂存数据，正式表与文件保持上轮内容，并在运行历史中记录原因码与详情。
+抓取结果先写入以 `run_id` 命名的 SQLite 暂存表（`stage_ann_*`、`stage_batch_*`）；全部成功后在**单个事务**内清空并重建正式清单，**事务提交成功之后**才用「同目录临时文件 + `os.replace` + `fsync`」原子替换 JSON 文件。任何失败（网络、HTTP 错误、CSV 非 UTF-8/缺列、分页异常、取消、事务提交失败）都只清理暂存数据，正式表与文件保持上轮内容，并在运行历史中记录原因码与详情。
+
+#### 网页、数据库与停售 JSON 的三方一致性
+
+数据库的已提交状态是清单的**唯一事实来源**，落盘 JSON 只是它的同版投影：
+
+- **提交顺序**：先提交数据库事务，再落盘 JSON。因此“元数据/事务提交失败”时文件根本不会被替换，网页与停售接口都停留在上一轮，绝不可能出现网页是旧版、停售接口返回未提交新版的情况。
+- **崩溃自愈**：若进程在“数据库已提交、JSON 落盘前”退出（或文件被提前替换成未提交版本），启动时的对账（`reconcile_manifest_file`）与停售接口的每次读取（`read_or_repair_manifest`）都会比较文件的 `published_run_id` 与数据库 `manifest_meta` 发布指针：文件缺失、损坏、超前、落后一律以数据库为准原子重建。重启后网页（`/api/manifest`）与停售接口（`/stop-sale/manifest.json`）只能呈现同一个已提交版本。
+- **落盘失败不丢发布**：JSON 落盘若发生 I/O 错误，该轮采集仍记为成功（数据库已发布），下次停售请求或重启即自动补齐文件；后续重新采集可正常发布下一轮。
 
 ### 3. 撤回不解除仍被覆盖的批次
 
@@ -80,7 +88,7 @@ app/                    采集端
 demo_feed/              演示源
   server.py             分页/附件接口 + /control/* 故障注入
   data/v{1,2,3}/        递增目录版本：pages/page_*.json + attachments/*.csv
-tests/                  16 个端到端/单元测试
+tests/                  28 个端到端/单元测试（含发布一致性专项）
 scripts/run_local.sh    无容器本地启动
 docker-compose.yml      feed(8010) + collector(8000)
 ```
@@ -88,7 +96,7 @@ docker-compose.yml      feed(8010) + collector(8000)
 ## 数据库与文件
 
 - SQLite（WAL 模式）表：`collection_runs`（运行历史与原因）、`source_announcements`（发布版本的公告快照，含撤回状态）、`manifest_entries`（当前拦截批号，部分唯一索引保证键唯一）、`manifest_meta`（单行发布指针）。
-- 停售 JSON：`/data/stop_sale_manifest.json`，按产品分组，每个批号带 `source_announcement_ids`；HTTP 入口 `/stop-sale/manifest.json` 返回同一文件内容。
+- 停售 JSON：`/data/stop_sale_manifest.json`，按产品分组，每个批号带 `source_announcement_ids`；HTTP 入口 `/stop-sale/manifest.json` 只返回与数据库发布指针同版的内容，发现文件落后/超前/损坏/缺失时即时按数据库重建。应用启动时也会执行一次同样的对账，覆盖“提交后、落盘前进程退出并重启”的场景。
 
 ## 测试
 
@@ -96,4 +104,4 @@ docker-compose.yml      feed(8010) + collector(8000)
 python -m pytest tests/ -q
 ```
 
-覆盖：全量采集与同版 JSON、静态/运行时撤回、撤回覆盖保留、附件 500 与损坏、翻页中途切版本、手动取消、并发旧版本拒绝、409 单运行保护、页面渲染、UTF-8 中文 CSV，以及发布守卫与来源聚合的数据库单元测试。
+覆盖：全量采集与同版 JSON、静态/运行时撤回、撤回覆盖保留、附件 500 与损坏、翻页中途切版本、手动取消、并发旧版本拒绝、409 单运行保护、页面渲染、UTF-8 中文 CSV、发布守卫与来源聚合的数据库单元测试，以及**发布一致性专项**（数据库提交失败保留上轮且文件不被替换、未提交文件被停售接口回退修复、提交后落盘前崩溃的读取自愈与重启对账、损坏/缺失/游离文件清理、失败后重新采集正常发布）。

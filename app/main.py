@@ -9,12 +9,11 @@ API：
   GET  /api/runs           运行历史
   GET  /api/manifest       当前清单 JSON（网页同源数据）
   GET  /api/announcements  最近发布版本的公告（含撤回状态）
-  GET  /stop-sale/manifest.json  停售系统读取的同版 JSON（与落盘文件一致）
+  GET  /stop-sale/manifest.json  停售系统读取的同版 JSON（以数据库已提交版本为准，自动对账修复落盘文件）
 """
 from __future__ import annotations
 
 import asyncio
-import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -36,6 +35,9 @@ _RUNNING: dict[int, tuple[asyncio.Task, asyncio.Event]] = {}
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db.init_db()
+    # 重启对账：若上次进程在“数据库已提交、JSON 落盘前”退出（或文件被
+    # 提前替换），以数据库已提交版本重建文件，保证网页与停售接口同版。
+    await asyncio.to_thread(db.reconcile_manifest_file)
     yield
     # 进程退出时取消未完成的采集（暂存数据会被清理，正式清单不变）
     for _, event in list(_RUNNING.values()):
@@ -124,20 +126,14 @@ async def api_announcement_detail(announcement_id: str) -> dict:
 
 @app.get("/stop-sale/manifest.json")
 async def stop_sale_manifest() -> JSONResponse:
-    """停售系统读取入口：优先返回与数据库同版的落盘 JSON。"""
-    path = config.MANIFEST_PATH
-    if path.is_file():
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return JSONResponse(data)
-        except (json.JSONDecodeError, OSError):
-            pass
-    meta = db.get_published_meta()
-    if meta is None:
-        return JSONResponse(
-            {"manifest_version": 1, "entry_count": 0, "products": [], "note": "尚未发布任何清单"}
-        )
-    raise HTTPException(status_code=500, detail="清单文件暂不可读，请稍后重试")
+    """停售系统读取入口：只返回与数据库已提交版本同版的 JSON。
+
+    落盘文件的 published_run_id 必须等于数据库发布指针；文件缺失、
+    损坏、超前（未提交版本）或落后时，按数据库重建后再返回，因此
+    该接口与网页（/api/manifest）永远呈现同一已提交轮次。
+    """
+    payload = await asyncio.to_thread(db.read_or_repair_manifest)
+    return JSONResponse(payload)
 
 
 # ---------------------------------------------------------------------------
